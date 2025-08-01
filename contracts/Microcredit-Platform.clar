@@ -770,3 +770,179 @@
         false
     )
 )
+
+(define-constant min-refinance-improvement u100)
+(define-constant refinance-fee-rate u25)
+(define-constant max-refinance-count u5)
+(define-constant err-no-improvement (err u117))
+(define-constant err-max-refinances (err u118))
+(define-constant err-refinance-failed (err u119))
+
+(define-data-var next-refinance-id uint u0)
+
+(define-map loan-refinance-history
+    { original-loan-id: uint }
+    {
+        refinance-count: uint,
+        last-refinance-height: uint,
+        original-rate: uint,
+        current-rate: uint,
+    }
+)
+
+(define-map refinance-records
+    { refinance-id: uint }
+    {
+        original-loan-id: uint,
+        new-loan-id: uint,
+        borrower: principal,
+        old-rate: uint,
+        new-rate: uint,
+        old-amount: uint,
+        new-amount: uint,
+        refinance-height: uint,
+        fee-paid: uint,
+    }
+)
+
+(define-public (refinance-loan
+        (loan-id uint)
+        (new-collateral uint)
+    )
+    (let (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+            (current-rate (get interest-rate loan))
+            (remaining-amount (- (get amount loan) (get repaid-amount loan)))
+            (new-rate (unwrap!
+                (get-current-rate-for-loan remaining-amount (get duration loan)
+                    tx-sender
+                )
+                err-invalid-amount
+            ))
+            (rate-improvement (- current-rate new-rate))
+            (refinance-history (default-to {
+                refinance-count: u0,
+                last-refinance-height: u0,
+                original-rate: current-rate,
+                current-rate: current-rate,
+            }
+                (map-get? loan-refinance-history { original-loan-id: loan-id })
+            ))
+            (refinance-fee (/ (* remaining-amount refinance-fee-rate) u10000))
+            (new-loan-id (+ (var-get next-loan-id) u1))
+            (refinance-id (+ (var-get next-refinance-id) u1))
+            (total-collateral (+ (get collateral loan) new-collateral))
+            (collateral-ratio (/ (* total-collateral u100) remaining-amount))
+        )
+        (asserts! (is-eq (get borrower loan) tx-sender) err-unauthorized)
+        (asserts! (is-eq (get status loan) "ACTIVE") err-loan-not-active)
+        (asserts! (>= rate-improvement min-refinance-improvement)
+            err-no-improvement
+        )
+        (asserts! (< (get refinance-count refinance-history) max-refinance-count)
+            err-max-refinances
+        )
+        (asserts! (>= collateral-ratio (var-get min-collateral-ratio))
+            err-insufficient-collateral
+        )
+        (if (> new-collateral u0)
+            (try! (stx-transfer? new-collateral tx-sender (as-contract tx-sender)))
+            true
+        )
+        (try! (stx-transfer? refinance-fee tx-sender (as-contract tx-sender)))
+        (map-set loans { loan-id: loan-id } (merge loan { status: "REFINANCED" }))
+        (map-set loans { loan-id: new-loan-id } {
+            borrower: tx-sender,
+            lender: (get lender loan),
+            amount: remaining-amount,
+            collateral: total-collateral,
+            interest-rate: new-rate,
+            duration: (get duration loan),
+            status: "ACTIVE",
+            start-height: stacks-block-height,
+            repaid-amount: u0,
+        })
+        (map-set loan-refinance-history { original-loan-id: loan-id } {
+            refinance-count: (+ (get refinance-count refinance-history) u1),
+            last-refinance-height: stacks-block-height,
+            original-rate: (get original-rate refinance-history),
+            current-rate: new-rate,
+        })
+        (map-set refinance-records { refinance-id: refinance-id } {
+            original-loan-id: loan-id,
+            new-loan-id: new-loan-id,
+            borrower: tx-sender,
+            old-rate: current-rate,
+            new-rate: new-rate,
+            old-amount: (get amount loan),
+            new-amount: remaining-amount,
+            refinance-height: stacks-block-height,
+            fee-paid: refinance-fee,
+        })
+        (var-set next-loan-id new-loan-id)
+        (var-set next-refinance-id refinance-id)
+        (ok {
+            new-loan-id: new-loan-id,
+            old-rate: current-rate,
+            new-rate: new-rate,
+            rate-savings: rate-improvement,
+            fee-paid: refinance-fee,
+        })
+    )
+)
+
+(define-read-only (get-refinance-eligibility (loan-id uint))
+    (match (map-get? loans { loan-id: loan-id })
+        loan (let (
+                (current-rate (get interest-rate loan))
+                (remaining-amount (- (get amount loan) (get repaid-amount loan)))
+                (new-rate-result (get-current-rate-for-loan remaining-amount (get duration loan)
+                    (get borrower loan)
+                ))
+                (refinance-history (default-to {
+                    refinance-count: u0,
+                    last-refinance-height: u0,
+                    original-rate: current-rate,
+                    current-rate: current-rate,
+                }
+                    (map-get? loan-refinance-history { original-loan-id: loan-id })
+                ))
+            )
+            (if (is-ok new-rate-result)
+                (let (
+                        (new-rate (unwrap-panic new-rate-result))
+                        (rate-improvement (if (> current-rate new-rate)
+                            (- current-rate new-rate)
+                            u0
+                        ))
+                        (is-eligible (and
+                            (is-eq (get status loan) "ACTIVE")
+                            (>= rate-improvement min-refinance-improvement)
+                            (< (get refinance-count refinance-history)
+                                max-refinance-count
+                            )
+                        ))
+                    )
+                    (ok {
+                        eligible: is-eligible,
+                        current-rate: current-rate,
+                        new-rate: new-rate,
+                        rate-savings: rate-improvement,
+                        refinance-count: (get refinance-count refinance-history),
+                        remaining-amount: remaining-amount,
+                    })
+                )
+                (err err-invalid-amount)
+            )
+        )
+        (err err-not-found)
+    )
+)
+
+(define-read-only (get-refinance-record (refinance-id uint))
+    (map-get? refinance-records { refinance-id: refinance-id })
+)
+
+(define-read-only (get-loan-refinance-history (loan-id uint))
+    (map-get? loan-refinance-history { original-loan-id: loan-id })
+)
