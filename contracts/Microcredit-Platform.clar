@@ -946,3 +946,229 @@
 (define-read-only (get-loan-refinance-history (loan-id uint))
     (map-get? loan-refinance-history { original-loan-id: loan-id })
 )
+
+(define-constant health-warning-threshold u140)
+(define-constant health-critical-threshold u125)
+(define-constant payment-warning-blocks u720)
+(define-constant health-check-reward u100)
+(define-constant err-loan-healthy (err u120))
+(define-constant err-alert-exists (err u121))
+
+(define-data-var next-alert-id uint u0)
+
+(define-map loan-health-alerts
+    { loan-id: uint }
+    {
+        health-score: uint,
+        alert-level: (string-ascii 20),
+        last-check-height: uint,
+        payment-due-blocks: uint,
+        triggered-by: principal,
+    }
+)
+
+(define-map health-check-rewards
+    { checker: principal }
+    {
+        total-rewards: uint,
+        successful-checks: uint,
+        last-reward-height: uint,
+    }
+)
+
+(define-private (calculate-loan-health-score (loan-id uint))
+    (match (map-get? loans { loan-id: loan-id })
+        loan (let (
+                (loan-for-interest {
+                    borrower: (get borrower loan),
+                    amount: (get amount loan),
+                    interest-rate: (get interest-rate loan),
+                    duration: (get duration loan),
+                    start-height: (get start-height loan),
+                })
+                (total-debt (+ (get amount loan) (calculate-interest loan-for-interest)))
+                (remaining-debt (- total-debt (get repaid-amount loan)))
+                (current-ratio (/ (* (get collateral loan) u100) remaining-debt))
+                (blocks-since-start (- stacks-block-height (get start-height loan)))
+                (payment-progress (/ (* (get repaid-amount loan) u100) total-debt))
+                (time-progress (/ (* blocks-since-start u100) (get duration loan)))
+                (payment-velocity-score (if (> time-progress u0)
+                    (/ payment-progress time-progress)
+                    u100
+                ))
+                (health-score (/ (+ current-ratio payment-velocity-score) u2))
+            )
+            (ok health-score)
+        )
+        (err err-not-found)
+    )
+)
+
+(define-public (trigger-health-alert (loan-id uint))
+    (let (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+            (health-score (unwrap! (calculate-loan-health-score loan-id) err-not-found))
+            (existing-alert (map-get? loan-health-alerts { loan-id: loan-id }))
+            (blocks-since-start (- stacks-block-height (get start-height loan)))
+            (payment-due-blocks (- (get duration loan) blocks-since-start))
+            (alert-level (if (< health-score health-critical-threshold)
+                "CRITICAL"
+                (if (< health-score health-warning-threshold)
+                    "WARNING"
+                    "HEALTHY"
+                )
+            ))
+            (reward-amount (if (or
+                    (is-eq alert-level "WARNING")
+                    (is-eq alert-level "CRITICAL")
+                )
+                health-check-reward
+                u0
+            ))
+        )
+        (asserts! (is-eq (get status loan) "ACTIVE") err-loan-not-active)
+        (asserts! (not (is-eq alert-level "HEALTHY")) err-loan-healthy)
+        (asserts! (is-none existing-alert) err-alert-exists)
+        (map-set loan-health-alerts { loan-id: loan-id } {
+            health-score: health-score,
+            alert-level: alert-level,
+            last-check-height: stacks-block-height,
+            payment-due-blocks: payment-due-blocks,
+            triggered-by: tx-sender,
+        })
+        (if (> reward-amount u0)
+            (let ((checker-rewards (default-to {
+                    total-rewards: u0,
+                    successful-checks: u0,
+                    last-reward-height: u0,
+                }
+                    (map-get? health-check-rewards { checker: tx-sender })
+                )))
+                (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+                (map-set health-check-rewards { checker: tx-sender } {
+                    total-rewards: (+ (get total-rewards checker-rewards) reward-amount),
+                    successful-checks: (+ (get successful-checks checker-rewards) u1),
+                    last-reward-height: stacks-block-height,
+                })
+                (ok {
+                    alert-triggered: true,
+                    health-score: health-score,
+                    alert-level: alert-level,
+                    reward-earned: reward-amount,
+                })
+            )
+            (ok {
+                alert-triggered: true,
+                health-score: health-score,
+                alert-level: alert-level,
+                reward-earned: u0,
+            })
+        )
+    )
+)
+
+(define-public (update-health-status (loan-id uint))
+    (let (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+            (health-score (unwrap! (calculate-loan-health-score loan-id) err-not-found))
+            (existing-alert (map-get? loan-health-alerts { loan-id: loan-id }))
+            (blocks-since-start (- stacks-block-height (get start-height loan)))
+            (payment-due-blocks (- (get duration loan) blocks-since-start))
+            (alert-level (if (< health-score health-critical-threshold)
+                "CRITICAL"
+                (if (< health-score health-warning-threshold)
+                    "WARNING"
+                    "HEALTHY"
+                )
+            ))
+        )
+        (asserts! (is-eq (get status loan) "ACTIVE") err-loan-not-active)
+        (if (is-some existing-alert)
+            (map-set loan-health-alerts { loan-id: loan-id } {
+                health-score: health-score,
+                alert-level: alert-level,
+                last-check-height: stacks-block-height,
+                payment-due-blocks: payment-due-blocks,
+                triggered-by: (get triggered-by (unwrap-panic existing-alert)),
+            })
+            (if (not (is-eq alert-level "HEALTHY"))
+                (map-set loan-health-alerts { loan-id: loan-id } {
+                    health-score: health-score,
+                    alert-level: alert-level,
+                    last-check-height: stacks-block-height,
+                    payment-due-blocks: payment-due-blocks,
+                    triggered-by: tx-sender,
+                })
+                true
+            )
+        )
+        (ok {
+            health-score: health-score,
+            alert-level: alert-level,
+            payment-due-blocks: payment-due-blocks,
+        })
+    )
+)
+
+(define-public (clear-health-alert (loan-id uint))
+    (let (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+            (health-score (unwrap! (calculate-loan-health-score loan-id) err-not-found))
+        )
+        (asserts!
+            (or
+                (is-eq (get borrower loan) tx-sender)
+                (is-eq tx-sender contract-owner)
+            )
+            err-unauthorized
+        )
+        (asserts! (>= health-score health-warning-threshold) err-loan-healthy)
+        (map-delete loan-health-alerts { loan-id: loan-id })
+        (ok true)
+    )
+)
+
+(define-read-only (get-loan-health-status (loan-id uint))
+    (match (map-get? loans { loan-id: loan-id })
+        loan (let (
+                (health-score-result (calculate-loan-health-score loan-id))
+                (alert-info (map-get? loan-health-alerts { loan-id: loan-id }))
+                (blocks-since-start (- stacks-block-height (get start-height loan)))
+                (payment-due-blocks (- (get duration loan) blocks-since-start))
+            )
+            (match health-score-result
+                health-score (ok {
+                    loan-id: loan-id,
+                    borrower: (get borrower loan),
+                    health-score: health-score,
+                    current-status: (get status loan),
+                    payment-due-blocks: payment-due-blocks,
+                    has-alert: (is-some alert-info),
+                    alert-level: (if (is-some alert-info)
+                        (get alert-level (unwrap-panic alert-info))
+                        "HEALTHY"
+                    ),
+                    last-check: (if (is-some alert-info)
+                        (get last-check-height (unwrap-panic alert-info))
+                        u0
+                    ),
+                })
+                error-value (err error-value)
+            )
+        )
+        (err err-not-found)
+    )
+)
+
+(define-read-only (get-health-checker-stats (checker principal))
+    (map-get? health-check-rewards { checker: checker })
+)
+
+(define-read-only (get-loans-needing-health-check)
+    (ok {
+        warning-threshold: health-warning-threshold,
+        critical-threshold: health-critical-threshold,
+        payment-warning-blocks: payment-warning-blocks,
+        check-reward: health-check-reward,
+    })
+)
