@@ -1172,3 +1172,414 @@
         check-reward: health-check-reward,
     })
 )
+
+;; ========================================
+;; LOAN STATUS TRACKER FEATURE
+;; ========================================
+
+(define-constant max-events-per-loan u50)
+(define-constant err-max-events-reached (err u122))
+(define-constant err-invalid-event-type (err u123))
+
+(define-data-var next-event-id uint u0)
+(define-data-var total-tracked-loans uint u0)
+
+;; Loan event types
+(define-constant event-loan-created "LOAN_CREATED")
+(define-constant event-loan-funded "LOAN_FUNDED")
+(define-constant event-payment-made "PAYMENT_MADE")
+(define-constant event-loan-completed "LOAN_COMPLETED")
+(define-constant event-loan-liquidated "LOAN_LIQUIDATED")
+(define-constant event-loan-refinanced "LOAN_REFINANCED")
+(define-constant event-insurance-purchased "INSURANCE_PURCHASED")
+(define-constant event-health-alert "HEALTH_ALERT")
+(define-constant event-status-changed "STATUS_CHANGED")
+
+;; Map to track loan events chronologically
+(define-map loan-events
+    { event-id: uint }
+    {
+        loan-id: uint,
+        event-type: (string-ascii 20),
+        event-data: (string-ascii 100),
+        actor: principal,
+        block-height: uint,
+        timestamp-estimate: uint,
+        additional-info: (optional (string-ascii 50)),
+    }
+)
+
+;; Map to track events by loan ID for easy querying
+(define-map loan-event-log
+    { loan-id: uint }
+    {
+        event-count: uint,
+        first-event-id: uint,
+        last-event-id: uint,
+        created-height: uint,
+        last-activity-height: uint,
+    }
+)
+
+;; Track loan performance metrics
+(define-map loan-performance-metrics
+    { loan-id: uint }
+    {
+        total-payments: uint,
+        payment-count: uint,
+        average-payment-size: uint,
+        days-to-first-payment: uint,
+        on-time-payments: uint,
+        late-payments: uint,
+        current-streak: uint,
+        max-streak: uint,
+    }
+)
+
+;; User activity summary
+(define-map user-loan-activity
+    { user: principal }
+    {
+        total-loans-created: uint,
+        total-loans-funded: uint,
+        active-borrower-loans: uint,
+        active-lender-loans: uint,
+        completed-loans: uint,
+        defaulted-loans: uint,
+        total-volume-borrowed: uint,
+        total-volume-lent: uint,
+    }
+)
+
+;; Private function to log loan events
+(define-private (log-loan-event
+        (loan-id uint)
+        (event-type (string-ascii 20))
+        (event-data (string-ascii 100))
+        (actor principal)
+        (additional-info (optional (string-ascii 50)))
+    )
+    (let (
+            (event-id (+ (var-get next-event-id) u1))
+            (current-log (default-to {
+                event-count: u0,
+                first-event-id: u0,
+                last-event-id: u0,
+                created-height: stacks-block-height,
+                last-activity-height: stacks-block-height,
+            }
+                (map-get? loan-event-log { loan-id: loan-id })
+            ))
+            (timestamp-estimate (+ u1672531200 (* (- stacks-block-height u1) u600)))
+        )
+        (asserts! (< (get event-count current-log) max-events-per-loan)
+            err-max-events-reached
+        )
+        (map-set loan-events { event-id: event-id } {
+            loan-id: loan-id,
+            event-type: event-type,
+            event-data: event-data,
+            actor: actor,
+            block-height: stacks-block-height,
+            timestamp-estimate: timestamp-estimate,
+            additional-info: additional-info,
+        })
+        (map-set loan-event-log { loan-id: loan-id } {
+            event-count: (+ (get event-count current-log) u1),
+            first-event-id: (if (is-eq (get event-count current-log) u0)
+                event-id
+                (get first-event-id current-log)
+            ),
+            last-event-id: event-id,
+            created-height: (get created-height current-log),
+            last-activity-height: stacks-block-height,
+        })
+        (var-set next-event-id event-id)
+        (ok event-id)
+    )
+)
+
+;; Public function to manually log status changes (for admin use)
+(define-public (log-status-change
+        (loan-id uint)
+        (old-status (string-ascii 20))
+        (new-status (string-ascii 20))
+        (reason (string-ascii 50))
+    )
+    (let (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+            (event-data (concat "Status: " (concat old-status (concat " -> " new-status))))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender contract-owner)
+                (is-eq tx-sender (get borrower loan))
+                (match (get lender loan)
+                    lender-principal (is-eq tx-sender lender-principal)
+                    false
+                )
+            )
+            err-unauthorized
+        )
+        (try! (log-loan-event loan-id event-status-changed event-data tx-sender (some reason)))
+        (ok true)
+    )
+)
+
+;; Update user activity metrics
+(define-private (update-user-activity
+        (user principal)
+        (activity-type (string-ascii 20))
+        (amount uint)
+    )
+    (let (
+            (current-activity (default-to {
+                total-loans-created: u0,
+                total-loans-funded: u0,
+                active-borrower-loans: u0,
+                active-lender-loans: u0,
+                completed-loans: u0,
+                defaulted-loans: u0,
+                total-volume-borrowed: u0,
+                total-volume-lent: u0,
+            }
+                (map-get? user-loan-activity { user: user })
+            ))
+        )
+        (if (is-eq activity-type "LOAN_CREATED")
+            (map-set user-loan-activity { user: user }
+                (merge current-activity {
+                    total-loans-created: (+ (get total-loans-created current-activity) u1),
+                    active-borrower-loans: (+ (get active-borrower-loans current-activity) u1),
+                    total-volume-borrowed: (+ (get total-volume-borrowed current-activity) amount),
+                })
+            )
+            (if (is-eq activity-type "LOAN_FUNDED")
+                (map-set user-loan-activity { user: user }
+                    (merge current-activity {
+                        total-loans-funded: (+ (get total-loans-funded current-activity) u1),
+                        active-lender-loans: (+ (get active-lender-loans current-activity) u1),
+                        total-volume-lent: (+ (get total-volume-lent current-activity) amount),
+                    })
+                )
+                (if (is-eq activity-type "LOAN_COMPLETED")
+                    (map-set user-loan-activity { user: user }
+                        (merge current-activity {
+                            completed-loans: (+ (get completed-loans current-activity) u1),
+                            active-borrower-loans: (if (> (get active-borrower-loans current-activity) u0)
+                                (- (get active-borrower-loans current-activity) u1)
+                                u0
+                            ),
+                        })
+                    )
+                    true
+                )
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Enhanced create-loan function with event logging
+(define-public (create-loan-with-tracking
+        (amount uint)
+        (collateral uint)
+        (interest-rate uint)
+        (duration uint)
+    )
+    (let (
+            (loan-result (create-loan-with-approval amount collateral interest-rate duration))
+            (loan-id (unwrap! loan-result err-invalid-amount))
+        )
+        (try! (log-loan-event loan-id event-loan-created 
+            (concat "Amount: " (uint-to-ascii amount))
+            tx-sender
+            (some (concat "Rate: " (uint-to-ascii interest-rate)))
+        ))
+        (unwrap! (update-user-activity tx-sender "LOAN_CREATED" amount) err-invalid-amount)
+        (var-set total-tracked-loans (+ (var-get total-tracked-loans) u1))
+        (ok loan-id)
+    )
+)
+
+;; Enhanced fund-loan function with event logging
+(define-public (fund-loan-with-tracking (loan-id uint))
+    (let (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+            (amount (get amount loan))
+        )
+        (try! (fund-loan loan-id))
+        (try! (log-loan-event loan-id event-loan-funded
+            (concat "Funded: " (uint-to-ascii amount))
+            tx-sender
+            (some "Loan activated")
+        ))
+        (unwrap! (update-user-activity tx-sender "LOAN_FUNDED" amount) err-invalid-amount)
+        (ok true)
+    )
+)
+
+;; Enhanced repay-loan function with event logging and performance tracking
+(define-public (repay-loan-with-tracking
+        (loan-id uint)
+        (payment uint)
+    )
+    (let (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+            (current-metrics (default-to {
+                total-payments: u0,
+                payment-count: u0,
+                average-payment-size: u0,
+                days-to-first-payment: u0,
+                on-time-payments: u0,
+                late-payments: u0,
+                current-streak: u0,
+                max-streak: u0,
+            }
+                (map-get? loan-performance-metrics { loan-id: loan-id })
+            ))
+            (new-payment-count (+ (get payment-count current-metrics) u1))
+            (new-total-payments (+ (get total-payments current-metrics) payment))
+            (new-average (/ new-total-payments new-payment-count))
+            (blocks-since-start (- stacks-block-height (get start-height loan)))
+            (is-first-payment (is-eq (get payment-count current-metrics) u0))
+            (days-to-first (if is-first-payment (/ blocks-since-start u144) u0))
+        )
+        (try! (repay-loan loan-id payment))
+        (try! (log-loan-event loan-id event-payment-made
+            (concat "Payment: " (uint-to-ascii payment))
+            tx-sender
+            (some (concat "Remaining: " (uint-to-ascii (- (get amount loan) (get repaid-amount loan)))))
+        ))
+        (map-set loan-performance-metrics { loan-id: loan-id } {
+            total-payments: new-total-payments,
+            payment-count: new-payment-count,
+            average-payment-size: new-average,
+            days-to-first-payment: (if is-first-payment days-to-first (get days-to-first-payment current-metrics)),
+            on-time-payments: (+ (get on-time-payments current-metrics) u1),
+            late-payments: (get late-payments current-metrics),
+            current-streak: (+ (get current-streak current-metrics) u1),
+            max-streak: (if (> (+ (get current-streak current-metrics) u1) (get max-streak current-metrics))
+                (+ (get current-streak current-metrics) u1)
+                (get max-streak current-metrics)
+            ),
+        })
+        ;; Check if loan is completed
+        (let ((updated-loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found)))
+            (if (is-eq (get status updated-loan) "COMPLETED")
+                (begin
+                    (try! (log-loan-event loan-id event-loan-completed
+                        "Loan fully repaid"
+                        tx-sender
+                        (some "Final payment")
+                    ))
+                    (unwrap! (update-user-activity tx-sender "LOAN_COMPLETED" u0) err-invalid-amount)
+                    (ok true)
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+;; Read-only functions to query loan tracking data
+
+(define-read-only (get-loan-events (loan-id uint) (limit uint) (offset uint))
+    (match (map-get? loan-event-log { loan-id: loan-id })
+        log-info (let (
+                (start-event-id (+ (get first-event-id log-info) offset))
+                (target-end (+ start-event-id limit))
+                (last-event (get last-event-id log-info))
+                (end-event-id (if (< target-end last-event) target-end last-event))
+            )
+            (ok {
+                loan-id: loan-id,
+                total-events: (get event-count log-info),
+                events-returned: (if (> end-event-id start-event-id) (- end-event-id start-event-id) u0),
+                first-event-id: (get first-event-id log-info),
+                last-event-id: (get last-event-id log-info),
+            })
+        )
+        (err err-not-found)
+    )
+)
+
+(define-read-only (get-loan-event-details (event-id uint))
+    (ok (map-get? loan-events { event-id: event-id }))
+)
+
+(define-read-only (get-loan-performance-metrics (loan-id uint))
+    (ok (map-get? loan-performance-metrics { loan-id: loan-id }))
+)
+
+(define-read-only (get-user-activity-summary (user principal))
+    (ok (map-get? user-loan-activity { user: user }))
+)
+
+(define-read-only (get-platform-tracking-stats)
+    (ok {
+        total-tracked-loans: (var-get total-tracked-loans),
+        total-events-logged: (var-get next-event-id),
+        max-events-per-loan: max-events-per-loan,
+    })
+)
+
+(define-read-only (get-loan-timeline-summary (loan-id uint))
+    (match (map-get? loans { loan-id: loan-id })
+        loan (match (map-get? loan-event-log { loan-id: loan-id })
+            event-log (let (
+                    (performance (map-get? loan-performance-metrics { loan-id: loan-id }))
+                    (insurance-info (map-get? loan-insurance { loan-id: loan-id }))
+                    (health-alert (map-get? loan-health-alerts { loan-id: loan-id }))
+                )
+                (ok {
+                    loan-basic-info: {
+                        loan-id: loan-id,
+                        borrower: (get borrower loan),
+                        lender: (get lender loan),
+                        amount: (get amount loan),
+                        status: (get status loan),
+                        collateral: (get collateral loan),
+                        interest-rate: (get interest-rate loan),
+                    },
+                    tracking-info: {
+                        created-height: (get created-height event-log),
+                        last-activity-height: (get last-activity-height event-log),
+                        total-events: (get event-count event-log),
+                        days-active: (/ (- (get last-activity-height event-log) (get created-height event-log)) u144),
+                    },
+                    performance-metrics: performance,
+                    has-insurance: (is-some insurance-info),
+                    has-health-alert: (is-some health-alert),
+                })
+            )
+            (err err-not-found)
+        )
+        (err err-not-found)
+    )
+)
+
+;; Utility function to convert uint to ascii (simplified version)
+(define-private (uint-to-ascii (num uint))
+    (if (is-eq num u0)
+        "0"
+        (if (<= num u9)
+            (if (is-eq num u1) "1"
+                (if (is-eq num u2) "2"
+                    (if (is-eq num u3) "3"
+                        (if (is-eq num u4) "4"
+                            (if (is-eq num u5) "5"
+                                (if (is-eq num u6) "6"
+                                    (if (is-eq num u7) "7"
+                                        (if (is-eq num u8) "8" "9")
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+            "big-number"
+        )
+    )
+)
