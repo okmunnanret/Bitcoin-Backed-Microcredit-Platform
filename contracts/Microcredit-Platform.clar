@@ -953,6 +953,8 @@
 (define-constant health-check-reward u100)
 (define-constant err-loan-healthy (err u120))
 (define-constant err-alert-exists (err u121))
+(define-constant err-cancel-not-allowed (err u124))
+(define-constant err-refund-failed (err u125))
 
 (define-data-var next-alert-id uint u0)
 
@@ -1321,7 +1323,9 @@
             )
             err-unauthorized
         )
-        (try! (log-loan-event loan-id event-status-changed event-data tx-sender (some reason)))
+        (try! (log-loan-event loan-id event-status-changed event-data tx-sender
+            (some reason)
+        ))
         (ok true)
     )
 )
@@ -1332,20 +1336,18 @@
         (activity-type (string-ascii 20))
         (amount uint)
     )
-    (let (
-            (current-activity (default-to {
-                total-loans-created: u0,
-                total-loans-funded: u0,
-                active-borrower-loans: u0,
-                active-lender-loans: u0,
-                completed-loans: u0,
-                defaulted-loans: u0,
-                total-volume-borrowed: u0,
-                total-volume-lent: u0,
-            }
-                (map-get? user-loan-activity { user: user })
-            ))
-        )
+    (let ((current-activity (default-to {
+            total-loans-created: u0,
+            total-loans-funded: u0,
+            active-borrower-loans: u0,
+            active-lender-loans: u0,
+            completed-loans: u0,
+            defaulted-loans: u0,
+            total-volume-borrowed: u0,
+            total-volume-lent: u0,
+        }
+            (map-get? user-loan-activity { user: user })
+        )))
         (if (is-eq activity-type "LOAN_CREATED")
             (map-set user-loan-activity { user: user }
                 (merge current-activity {
@@ -1366,8 +1368,12 @@
                     (map-set user-loan-activity { user: user }
                         (merge current-activity {
                             completed-loans: (+ (get completed-loans current-activity) u1),
-                            active-borrower-loans: (if (> (get active-borrower-loans current-activity) u0)
-                                (- (get active-borrower-loans current-activity) u1)
+                            active-borrower-loans: (if (> (get active-borrower-loans current-activity)
+                                    u0
+                                )
+                                (- (get active-borrower-loans current-activity)
+                                    u1
+                                )
                                 u0
                             ),
                         })
@@ -1391,12 +1397,13 @@
             (loan-result (create-loan-with-approval amount collateral interest-rate duration))
             (loan-id (unwrap! loan-result err-invalid-amount))
         )
-        (try! (log-loan-event loan-id event-loan-created 
-            (concat "Amount: " (uint-to-ascii amount))
-            tx-sender
+        (try! (log-loan-event loan-id event-loan-created
+            (concat "Amount: " (uint-to-ascii amount)) tx-sender
             (some (concat "Rate: " (uint-to-ascii interest-rate)))
         ))
-        (unwrap! (update-user-activity tx-sender "LOAN_CREATED" amount) err-invalid-amount)
+        (unwrap! (update-user-activity tx-sender "LOAN_CREATED" amount)
+            err-invalid-amount
+        )
         (var-set total-tracked-loans (+ (var-get total-tracked-loans) u1))
         (ok loan-id)
     )
@@ -1410,11 +1417,12 @@
         )
         (try! (fund-loan loan-id))
         (try! (log-loan-event loan-id event-loan-funded
-            (concat "Funded: " (uint-to-ascii amount))
-            tx-sender
+            (concat "Funded: " (uint-to-ascii amount)) tx-sender
             (some "Loan activated")
         ))
-        (unwrap! (update-user-activity tx-sender "LOAN_FUNDED" amount) err-invalid-amount)
+        (unwrap! (update-user-activity tx-sender "LOAN_FUNDED" amount)
+            err-invalid-amount
+        )
         (ok true)
     )
 )
@@ -1443,23 +1451,32 @@
             (new-average (/ new-total-payments new-payment-count))
             (blocks-since-start (- stacks-block-height (get start-height loan)))
             (is-first-payment (is-eq (get payment-count current-metrics) u0))
-            (days-to-first (if is-first-payment (/ blocks-since-start u144) u0))
+            (days-to-first (if is-first-payment
+                (/ blocks-since-start u144)
+                u0
+            ))
         )
         (try! (repay-loan loan-id payment))
         (try! (log-loan-event loan-id event-payment-made
-            (concat "Payment: " (uint-to-ascii payment))
-            tx-sender
-            (some (concat "Remaining: " (uint-to-ascii (- (get amount loan) (get repaid-amount loan)))))
+            (concat "Payment: " (uint-to-ascii payment)) tx-sender
+            (some (concat "Remaining: "
+                (uint-to-ascii (- (get amount loan) (get repaid-amount loan)))
+            ))
         ))
         (map-set loan-performance-metrics { loan-id: loan-id } {
             total-payments: new-total-payments,
             payment-count: new-payment-count,
             average-payment-size: new-average,
-            days-to-first-payment: (if is-first-payment days-to-first (get days-to-first-payment current-metrics)),
+            days-to-first-payment: (if is-first-payment
+                days-to-first
+                (get days-to-first-payment current-metrics)
+            ),
             on-time-payments: (+ (get on-time-payments current-metrics) u1),
             late-payments: (get late-payments current-metrics),
             current-streak: (+ (get current-streak current-metrics) u1),
-            max-streak: (if (> (+ (get current-streak current-metrics) u1) (get max-streak current-metrics))
+            max-streak: (if (> (+ (get current-streak current-metrics) u1)
+                    (get max-streak current-metrics)
+                )
                 (+ (get current-streak current-metrics) u1)
                 (get max-streak current-metrics)
             ),
@@ -1469,11 +1486,11 @@
             (if (is-eq (get status updated-loan) "COMPLETED")
                 (begin
                     (try! (log-loan-event loan-id event-loan-completed
-                        "Loan fully repaid"
-                        tx-sender
-                        (some "Final payment")
+                        "Loan fully repaid" tx-sender (some "Final payment")
                     ))
-                    (unwrap! (update-user-activity tx-sender "LOAN_COMPLETED" u0) err-invalid-amount)
+                    (unwrap! (update-user-activity tx-sender "LOAN_COMPLETED" u0)
+                        err-invalid-amount
+                    )
                     (ok true)
                 )
                 (ok true)
@@ -1484,18 +1501,28 @@
 
 ;; Read-only functions to query loan tracking data
 
-(define-read-only (get-loan-events (loan-id uint) (limit uint) (offset uint))
+(define-read-only (get-loan-events
+        (loan-id uint)
+        (limit uint)
+        (offset uint)
+    )
     (match (map-get? loan-event-log { loan-id: loan-id })
         log-info (let (
                 (start-event-id (+ (get first-event-id log-info) offset))
                 (target-end (+ start-event-id limit))
                 (last-event (get last-event-id log-info))
-                (end-event-id (if (< target-end last-event) target-end last-event))
+                (end-event-id (if (< target-end last-event)
+                    target-end
+                    last-event
+                ))
             )
             (ok {
                 loan-id: loan-id,
                 total-events: (get event-count log-info),
-                events-returned: (if (> end-event-id start-event-id) (- end-event-id start-event-id) u0),
+                events-returned: (if (> end-event-id start-event-id)
+                    (- end-event-id start-event-id)
+                    u0
+                ),
                 first-event-id: (get first-event-id log-info),
                 last-event-id: (get last-event-id log-info),
             })
@@ -1546,7 +1573,12 @@
                         created-height: (get created-height event-log),
                         last-activity-height: (get last-activity-height event-log),
                         total-events: (get event-count event-log),
-                        days-active: (/ (- (get last-activity-height event-log) (get created-height event-log)) u144),
+                        days-active: (/
+                            (- (get last-activity-height event-log)
+                                (get created-height event-log)
+                            )
+                            u144
+                        ),
                     },
                     performance-metrics: performance,
                     has-insurance: (is-some insurance-info),
@@ -1564,14 +1596,24 @@
     (if (is-eq num u0)
         "0"
         (if (<= num u9)
-            (if (is-eq num u1) "1"
-                (if (is-eq num u2) "2"
-                    (if (is-eq num u3) "3"
-                        (if (is-eq num u4) "4"
-                            (if (is-eq num u5) "5"
-                                (if (is-eq num u6) "6"
-                                    (if (is-eq num u7) "7"
-                                        (if (is-eq num u8) "8" "9")
+            (if (is-eq num u1)
+                "1"
+                (if (is-eq num u2)
+                    "2"
+                    (if (is-eq num u3)
+                        "3"
+                        (if (is-eq num u4)
+                            "4"
+                            (if (is-eq num u5)
+                                "5"
+                                (if (is-eq num u6)
+                                    "6"
+                                    (if (is-eq num u7)
+                                        "7"
+                                        (if (is-eq num u8)
+                                            "8"
+                                            "9"
+                                        )
                                     )
                                 )
                             )
@@ -1581,5 +1623,28 @@
             )
             "big-number"
         )
+    )
+)
+
+(define-public (cancel-loan (loan-id uint))
+    (let (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+            (status (get status loan))
+            (collateral (get collateral loan))
+            (borrower (get borrower loan))
+            (lender (get lender loan))
+        )
+        (asserts! (is-eq borrower tx-sender) err-unauthorized)
+        (asserts! (is-none lender) err-cancel-not-allowed)
+        (asserts!
+            (or
+                (is-eq status "PENDING")
+                (is-eq status "PENDING_APPROVAL")
+            )
+            err-cancel-not-allowed
+        )
+        (try! (as-contract (stx-transfer? collateral tx-sender borrower)))
+        (map-set loans { loan-id: loan-id } (merge loan { status: "CANCELLED" }))
+        (ok true)
     )
 )
